@@ -60,12 +60,12 @@ void *mem_sbrk(int incr)
     char *old_brk = mem_brk;
 
     if ( (incr < 0) || ((mem_brk + incr) > mem_max_addr)) {
-	errno = ENOMEM;
-	fprintf(stderr, "ERROR: mem_sbrk failed. Ran out of memory...\n");
-	return (void *)-1;
+        errno = ENOMEM;
+        fprintf(stderr, "ERROR: mem_sbrk failed. Ran out of memory...\n");
+        return (void *)-1;
     }
-    mem_brk += incr;
-    return (void *)old_brk;
+    mem_brk += incr;        // 할당할 메모리 크기(incr)만큼 브레이크(힙의 끝 부분) 위치를 증가시킨다.
+    return (void *)old_brk; // 이전 브레이크 위치(old_brk)를 반환한다. 이전 브레이크 위치와 증가된 브레이크 위치 사이의 메모리는 할당한 메모리 블록으로 사용된다.
 }
 
 /*
