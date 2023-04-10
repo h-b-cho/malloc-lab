@@ -85,28 +85,59 @@ team_t team = {
 /* define searching method for find suitable free blocks to allocate */
 // #define NEXT_FIT                        // define하면 next_fit, 안하면 first_fit으로 탐색한다.
 
-/* global variable & functions */
-static char *heap_listp;                // 항상 prologue block을 가리키는 정적 전역 변수 설정.
-                                        // static 변수는 함수 내부(지역)에서도 사용이 가능하고 함수 외부(전역)에서도 사용이 가능하다.
-
 // #ifdef NEXT_FIT                         // #ifdef ~ #endif를 통해 조건부로 컴파일이 가능하다. NEXT_FIT이 선언되어 있다면 밑의 변수를 컴파일 할 것이다.
 //     static void *last_freep;            // next_fit 사용 시 마지막으로 탐색한 free 블록을 가리키는 포인터이다.
 // #endif
 
+/* global variable & functions */
+static char *heap_listp;    // 항상 prologue block을 가리키는 정적 전역 변수 설정.
+                            // static 변수는 함수 내부(지역)에서도 사용이 가능하고 함수 외부(전역)에서도 사용이 가능하다.
+static char *last_bp;       // 
+
 static void *extend_heap(size_t words);
 static void *coalesce(void* bp);
 void mm_free(void* bp);
-static void *find_fit(size_t asize);
+static void *first_fit(size_t asize);
+static void *next_fit(size_t asize);
 static void place(void* bp, size_t asize);
+
+/* 
+ * mm_init - initialize the malloc package.
+ */
+int mm_init(void)
+{
+    /* Create the initial empty heap */
+    // mem_sbrk : 필요한 크기의 메모리가 힙 영역에 있는지 확인하고 만약 있다면 그 포인터 주소를, 아니면 -1 출력. 포인터만 옮기는 것.
+    if ((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1) {
+        return -1;
+    }// mem_sbrk()를 사용하여 4*WSIZE 바이트만큼 초기 힙 공간을 할당. 반환된 값이 (void *)-1 인 경우에는 힙 공간 할당이 실패했다는 것을 의미한다.
+
+    PUT(heap_listp, 0);                            // Alignment padding으로 unused word이다. 맨 처음 메모리를 8바이트 정렬(더블 워드)을 위해 사용하는 미사용 패딩이다.
+    PUT(heap_listp + (1 * WSIZE), PACK(DSIZE, 1)); // prologue header로, 맨 처음에서 4바이트 뒤에 header가 온다. 이 header에 사이즈(프롤로그는 8바이트)와 allocated 1(프롤로그는 사용하지 말라는 의미)을 통합한 값을 부여한다.
+    PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1)); // prologue footer로, 값은 header와 동일해야 한다.
+    PUT(heap_listp + (3 * WSIZE), PACK(0, 1));     // epilogue header
+
+    heap_listp += (2 * WSIZE); // 초기 프롤로그 블록 다음 위치로 heap_listp를 이동시킨다.
+    
+    /* Extend the empty heap with a free block of CHUNKSIZE bytes */
+    // 힙 영역에 메모리 요청.
+    if (extend_heap(CHUNKSIZE / WSIZE) == NULL) {
+        return -1;
+    }
+    
+    last_bp = heap_listp;
+
+    return 0;
+}
 
 void *extend_heap(size_t words)
 {
     char *bp;
     size_t size;
 
-    size = (words%2) ? (words+1)*WSIZE : words*WSIZE;       // words가 홀수로 들어왔다면 짝수로 바꿔준다. 짝수로 들어왔다면 그대로 WSIZE를 곱해준다. ex. 5만큼(5개의 워드 만큼) 확장하라고 하면, 6으로 만들고 24바이트로 만든다.
+    size = (words%2) ? (words+1)*WSIZE : words*WSIZE; // words가 홀수로 들어왔다면 짝수로 바꿔준다. 짝수로 들어왔다면 그대로 WSIZE를 곱해준다. ex. 5만큼(5개의 워드 만큼) 확장하라고 하면, 6으로 만들고 24바이트로 만든다.
     
-    if ((long)(bp = mem_sbrk(size)) == -1) {
+    if ((bp = mem_sbrk(size)) == (void *)-1) {
         return NULL;
     }// 변환한 사이즈만큼 메모리 확보에 실패하면 NULL이라는 주소값을 반환해 실패했음을 알린다.
     // bp 자체의 값, 즉 주소값이 32bit이므로 long으로 캐스팅(형 변환)한다. 그리고 mem_sbrk() 함수가 실행되므로 bp는 새로운 메모리의 첫 주소값을 가르키게 된다.
@@ -158,35 +189,25 @@ void *coalesce(void* bp)
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     }
+    last_bp = bp;
     return bp;
 }
 
-/* 
- * mm_init - initialize the malloc package.
- */
-int mm_init(void)
-{
-    if ((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1) {
-        return -1;
-    }// mem_sbrk()를 사용하여 4*WSIZE 바이트만큼 초기 힙 공간을 할당. 반환된 값이 (void *)-1 인 경우에는 힙 공간 할당이 실패했다는 것을 의미한다.
-
-    PUT(heap_listp, 0);                            // Alignment padding으로 unused word이다. 맨 처음 메모리를 8바이트 정렬(더블 워드)을 위해 사용하는 미사용 패딩이다.
-    PUT(heap_listp + (1 * WSIZE), PACK(DSIZE, 1)); // prologue header로, 맨 처음에서 4바이트 뒤에 header가 온다. 이 header에 사이즈(프롤로그는 8바이트)와 allocated 1(프롤로그는 사용하지 말라는 의미)을 통합한 값을 부여한다.
-    PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1)); // prologue footer로, 값은 header와 동일해야 한다.
-    PUT(heap_listp + (3 * WSIZE), PACK(0, 1));     // epilogue header
-
-    heap_listp += (2 * WSIZE); // 초기 프롤로그 블록 다음 위치로 heap_listp를 이동시킨다.
-
-    if (extend_heap(CHUNKSIZE / WSIZE) == NULL) {
-        return -1;
-    }
-    return 0;
-}
-
-void *find_fit(size_t asize)
+void *first_fit(size_t asize)
 {
     void *bp;
     for ( bp = heap_listp; GET_SIZE(HDRP(bp))>0; bp = NEXT_BLKP(bp) ) {
+        if ( (!GET_ALLOC(HDRP(bp))) && (asize<=GET_SIZE(HDRP(bp))) ) {
+            return bp;
+        }
+    }
+    return NULL;
+}
+
+void *next_fit(size_t asize)
+{
+    void *bp;
+    for ( bp = last_bp; GET_SIZE(HDRP(bp))>0; bp = NEXT_BLKP(bp) ) {
         if ( (!GET_ALLOC(HDRP(bp))) && (asize<=GET_SIZE(HDRP(bp))) ) {
             return bp;
         }
@@ -237,8 +258,9 @@ void *mm_malloc(size_t size) // 한 마디로 mm_malloc() 함수는 인자로 si
         // (size + DSIZE + 7) == 할당하고자 하는 내용의 크기 + block header(==4) + block footer(==4) + 오로지 적절한 값을 구하기 위하여 더해주는 값 7
     }
 
-    if ((bp = find_fit(asize)) != NULL) {
-        place(bp, asize);
+    if ((bp = next_fit(asize)) != NULL) {
+        place(bp, asize); // bp : 데이터를 할당할 수 있는 공간의 시작 위치
+        last_bp = bp;
         return bp;
     }
 
