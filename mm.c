@@ -84,22 +84,21 @@ team_t team = {
 
 #define PRED_LINK(bp)   (*((char **)bp))                                    // predecessor 포인터 위치.
 #define SUCC_LINK(bp)   (*((char **)(bp + WSIZE)))                          // successor 포인터 위치.
-// (void *)bp   == 블록 포인터 bp(payload를 가르키고 있는 포인터)의 주소.
-// *(void *)bp  == payload의 값. 즉, payload 안에 있는 첫번째 요소가 가진 값인데, explicit method 기준으로 이는 predecessor의 주소이다.
-// (void **)bp  == (void *)(void *)bp  == 
-// *(void **bp) == 
+// (void *)bp   == 블록 포인터 bp의 주소. 할당된 블록의 헤더가 저장된 주소이자, 해당 블록의 payload를 가리키는 포인터이다.
+// 여기서 bp는 메모리 블록의 첫 번째 바이트를 가리키는 포인터이며, 이를 void 포인터로 캐스팅하면 해당 메모리 블록의 시작 주소를 나타내는 값이 된다.
+// *(void *)bp  == 블록 포인터 bp가 가리키는 블록의 첫번째 워드의 값. payload의 주소.
+// (void **)bp  == (void *)(void *)bp  == payload의 값. 즉, payload 안에 있는 첫번째 요소가 가진 값인데, 우리의 코드 상에서 이는 predecessor를 가리키는 포인터이다.
+// *(void **bp) == 블록 포인터 bp가 가리키는 이전 블록의 주소. 이때 이전 블록은 free 블록 리스트에서 현재 블록의 이전 블록을 말한다. 이전 블록이 없으면 우리의 코드 상에서 이는 NULL을 반환한다.
 
 /* define searching method for find suitable free blocks to allocate */
-// #define NEXT_FIT                        // define하면 next_fit, 안하면 first_fit으로 탐색한다.
-
-// #ifdef NEXT_FIT                         // #ifdef ~ #endif를 통해 조건부로 컴파일이 가능하다. NEXT_FIT이 선언되어 있다면 밑의 변수를 컴파일 할 것이다.
-// #endif
+// #define NEXT_FIT            // define하면 next_fit, 안하면 first_fit으로 탐색한다.
 
 /* global variable & functions */
 static char *heap_listp;    // 항상 prologue block을 가리키는 정적 전역 변수 설정.
-                            // static 변수는 함수 내부(지역)에서도 사용이 가능하고 함수 외부(전역)에서도 사용이 가능하다.
 static char *free_listp;
-// static char *last_bp;
+#ifdef NEXT_FIT 
+    static char *last_bp;
+#endif
 
 static void list_add(void *p);
 static void list_remove(void *p);
@@ -108,7 +107,9 @@ static void *coalesce(void* bp);
 static void *extend_heap(size_t words);
 void mm_free(void* bp);
 static void *first_fit(size_t asize);
-// static void *next_fit(size_t asize);
+#ifdef NEXT_FIT 
+    static void *next_fit(size_t asize);
+#endif
 
 /* 
  * mm_init - initialize the malloc package.
@@ -129,7 +130,9 @@ int mm_init(void)
     PUT(heap_listp + (5*WSIZE), PACK(0, 1));                  // heap의 Epilog.
 
     free_listp = heap_listp + (2*WSIZE); // free_listp는 현재로서 predcessor를 가리킨다. 이 heap_listp를 초기 프롤로그 블록 다음 위치로 이동시킨다.
-    // last_bp = heap_listp;
+    #ifdef NEXT_FIT 
+        last_bp = heap_listp;
+    #endif
 
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
     // 힙 영역에 메모리 요청.
@@ -194,7 +197,9 @@ static void *coalesce(void* bp)
         bp = PREV_BLKP(bp);
         list_add(bp);
     }
-    // last_bp = bp;
+    #ifdef NEXT_FIT 
+        last_bp = bp;
+    #endif
     return bp;
 }
 
@@ -222,16 +227,18 @@ static void *first_fit(size_t asize)
     return NULL;
 }
 
-// void *next_fit(size_t asize)
-// {
-//     void *bp;
-//     for ( bp = last_bp; GET_SIZE(HDRP(bp))>0; bp = NEXT_BLKP(bp) ) {
-//         if ( (!GET_ALLOC(HDRP(bp))) && (asize<=GET_SIZE(HDRP(bp))) ) {
-//             return bp;
-//         }
-//     }
-//     return NULL;
-// }
+#ifdef NEXT_FIT 
+    void *next_fit(size_t asize)
+    {
+        void *bp;
+        for ( bp = last_bp; GET_SIZE(HDRP(bp))>0; bp = NEXT_BLKP(bp) ) {
+            if ( (!GET_ALLOC(HDRP(bp))) && (asize<=GET_SIZE(HDRP(bp))) ) {
+                return bp;
+            }
+        }
+        return NULL;
+    }
+#endif
 
 static void list_add(void *p){
     SUCC_LINK(p) = free_listp;
@@ -302,7 +309,9 @@ void *mm_malloc(size_t size) // 한 마디로 mm_malloc() 함수는 인자로 si
 
     if ((bp = first_fit(asize)) != NULL) {
         place(bp, asize); // bp : 데이터를 할당할 수 있는 공간의 시작 위치
-        // last_bp = bp;
+        #ifdef NEXT_FIT 
+            last_bp = bp;
+        #endif
         return bp;
     }
 
