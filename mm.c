@@ -55,7 +55,8 @@ team_t team = {
 /* 기본 상수와 매크로 */
 #define WSIZE       4                        // 워드 사이즈. (4 byte)
 #define DSIZE       8                        // 더블 워드 사이즈. (8 byte)
-#define CHUNKSIZE   (1<<12)                  // ==2의 12승(2^12 byte). 초기 free 블록이다. (<<는 shift 연산자. 2진수로 나타낼 경우 1을 왼쪽으로 12칸 이동함을 뜻한다. 따라서 CHUNKSIZE는 4096(= 2^12).)
+#define CHUNKSIZE  (1<<12)                   // == 1*2**12(2^12 byte), 즉 initial heap block. (<<는 shift 연산자. 2진수로 나타낼 경우 1을 왼쪽으로 12칸 이동함을 뜻한다. == 4096
+#define SEG_MAX     20                       // 2**3 ~ 2**32, 총 20개의 사이즈 클래스.
 
 #define MAX(x, y) (x>y?x:y)                  // 최댓값 함수 매크로.
 #define MIN(x, y) (x>y?y:x)                  // 최댓값 함수 매크로.
@@ -82,34 +83,33 @@ team_t team = {
 #define NEXT_BLKP(bp)   ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))   // 지금 블록의 payload를 가르키는 bp에, 지금 블록의 header 사이즈를 읽어서 더하면(word 만큼) 다음 블록의 payload를 가르키게 된다.
 #define PREV_BLKP(bp)   ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))   // 지금 블록의 payload를 가르키는 bp에, 이전 블록의 footer 사이즈를 읽어서 뺴면(double word 만큼) 이전 블록의 payload를 가르키게 된다.
 
-#define PRED_LINK(bp)   (*((char **)bp))                                    // predecessor 포인터 위치.
-#define SUCC_LINK(bp)   (*((char **)(bp + WSIZE)))                          // successor 포인터 위치.
+/* 포인터 p가 가리키는 메모리에 포인터 ptr을 입력 */
+#define SET_PTR(p, ptr) (*(unsigned int *)(p) = (unsigned int)(ptr))
+
+//가용 블럭 리스트에서 next 와 prev의 포인터를 반환
+#define NEXT_PTR(ptr) ((char *)(ptr))
+#define PREV_PTR(ptr) ((char *)(ptr) + WSIZE)
+
+//segregated list 내에서 next 와 prev의 포인터를 반환
+#define NEXT(ptr) (*(char **)(ptr))
+#define PREV(ptr) (*(char **)(PREV_PTR(ptr)))
 // (void *)bp   == 블록 포인터 bp의 주소. 할당된 블록의 헤더가 저장된 주소이자, 해당 블록의 payload를 가리키는 포인터이다.
 // 여기서 bp는 메모리 블록의 첫 번째 바이트를 가리키는 포인터이며, 이를 void 포인터로 캐스팅하면 해당 메모리 블록의 시작 주소를 나타내는 값이 된다.
 // *(void *)bp  == 블록 포인터 bp가 가리키는 블록의 첫번째 워드의 값. payload의 주소.
 // (void **)bp  == (void *)(void *)bp  == payload의 값. 즉, payload 안에 있는 첫번째 요소가 가진 값인데, 우리의 코드 상에서 이는 predecessor를 가리키는 포인터이다.
 // *(void **bp) == 블록 포인터 bp가 가리키는 이전 블록의 주소. 이때 이전 블록은 free 블록 리스트에서 현재 블록의 이전 블록을 말한다. 이전 블록이 없으면 우리의 코드 상에서 이는 NULL을 반환한다.
 
-/* define searching method for find suitable free blocks to allocate */
-// #define NEXT_FIT            // define하면 next_fit, 안하면 first_fit으로 탐색한다.
-
 /* global variable & functions */
-static char *heap_listp;    // 항상 prologue block을 가리키는 정적 전역 변수 설정.
-static char *free_listp;
-#ifdef NEXT_FIT 
-    static char *last_bp;
-#endif
+static char *heap_listp;
+void *seg_free_list[SEG_MAX];
 
-static void list_add(void *p);
-static void list_remove(void *p);
+static void seglist_add(void* ptr, size_t size);
+static void seglist_remove(void *ptr);
 void place(void* bp, size_t asize);
 static void *coalesce(void* bp);
 static void *extend_heap(size_t words);
 void mm_free(void* bp);
-static void *first_fit(size_t asize);
-#ifdef NEXT_FIT 
-    static void *next_fit(size_t asize);
-#endif
+static void *find_seg_fit(size_t asize);
 
 /* 
  * mm_init - initialize the malloc package.
@@ -118,28 +118,26 @@ int mm_init(void)
 {
     /* Create the initial empty heap */
     // mem_sbrk : 필요한 크기의 메모리가 힙 영역에 있는지 확인하고 만약 있다면 그 포인터 주소를, 아니면 -1 출력. 포인터만 옮기는 것.
-    if ((heap_listp = mem_sbrk(6*WSIZE)) == (void *)-1) {
+    if ((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1) {
         return -1;
-    }// mem_sbrk()를 사용하여 6*WSIZE 바이트만큼 초기 힙 공간을 할당. 반환된 값이 (void *)-1 인 경우에는 힙 공간 할당이 실패했다는 것을 의미한다.
+    }// mem_sbrk()를 사용하여 4*WSIZE 바이트만큼 초기 힙 공간을 할당. 반환된 값이 (void *)-1 인 경우에는 힙 공간 할당이 실패했다는 것을 의미한다.
 
-    PUT(heap_listp, 0);                                       // heap의 첫 패딩 - free(0)값을 넣어준다.
-    PUT(heap_listp + (1*WSIZE), PACK(DSIZE*2, 1));            // heap의 Prolog 헤더. header~footer의 길이 정보 16을 값으로 넣어준다.
-    PUT(heap_listp + (2*WSIZE), (int)NULL);                   // predcessor.
-    PUT(heap_listp + (3*WSIZE), (int)NULL);                   // sucessor.
-    PUT(heap_listp + (4*WSIZE), PACK(DSIZE*2, 1));            // heap의 Prolog 푸터. header에 들어가는 정보를 똑같이 넣어준다.
-    PUT(heap_listp + (5*WSIZE), PACK(0, 1));                  // heap의 Epilog.
+    for (int i=0; i<SEG_MAX; i++) {
+        seg_free_list[i] = NULL;
+    }
 
-    free_listp = heap_listp + (2*WSIZE); // free_listp는 현재로서 predcessor를 가리킨다. 이 heap_listp를 초기 프롤로그 블록 다음 위치로 이동시킨다.
-    #ifdef NEXT_FIT 
-        last_bp = heap_listp;
-    #endif
+    PUT(heap_listp, 0);                                     // Alignment padding.
+    PUT(heap_listp + (1*WSIZE), PACK(DSIZE, 1));            // heap의 Prologue header. header~footer의 길이 정보 16을 값으로 넣어준다.
+    PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1));            // heap의 Prologue footer. header에 들어가는 정보를 똑같이 넣어준다.
+    PUT(heap_listp + (3*WSIZE), PACK(0, 1));                // heap의 Epilogue header.
+
+    heap_listp += (2*WSIZE); // free_listp는 현재로서 predcessor를 가리킨다. 이 heap_listp를 초기 프롤로그 블록 다음 위치로 이동시킨다.
 
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
     // 힙 영역에 메모리 요청.
     if (extend_heap(CHUNKSIZE / WSIZE) == NULL) {
         return -1;
     }
-
     return 0;
 }
 
@@ -158,7 +156,8 @@ static void *extend_heap(size_t words)
     // 새 free 블록의 header와 footer를 정해준다. 자연스럽게 전 epilog 자리에는 새로운 header가 자리 잡게 된다. 그리고 epilog는 맨 뒤로 보내지게 된다.
     PUT(HDRP(bp), PACK(size, 0));         /* Free block header */
     PUT(FTRP(bp), PACK(size, 0));         /* Free block footer */
-    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); /* New epilog header */ // 앞에서 현재 bp(새롭게 늘어난 메모리의 첫 주소 값으로 역시 payload이다)의 header에 값을 부여해주었다. 따라서 이 header의 사이즈 값을 참조해 다음 블록의 payload를 가르킬 수 있고, 이 payload의 직전인 header는 epilog가 된다.
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); /* New epilogue header */ // 앞에서 현재 bp(새롭게 늘어난 메모리의 첫 주소 값으로 역시 payload이다)의 header에 값을 부여해주었다. 따라서 이 header의 사이즈 값을 참조해 다음 블록의 payload를 가르킬 수 있고, 이 payload의 직전인 header는 epilog가 된다.
+    seglist_add(bp, size);
 
     return coalesce(bp);
 }
@@ -170,94 +169,138 @@ static void *coalesce(void* bp)
     size_t size = GET_SIZE(HDRP(bp));
 
     if (prev_alloc && next_alloc) {
-        list_add(bp);
         return bp;
     }
     else if (prev_alloc && !next_alloc) {
-        list_remove(NEXT_BLKP(bp));
+        seglist_remove(bp);
+        seglist_remove(NEXT_BLKP(bp));
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
-        list_add(bp);
     }
     else if (!prev_alloc && next_alloc) {
-        list_remove(PREV_BLKP(bp));
+        seglist_remove(bp);
+        seglist_remove(PREV_BLKP(bp));
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
         PUT(FTRP(bp), PACK(size, 0));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
-        list_add(bp);
     }
     else {
-        list_remove(PREV_BLKP(bp));
-        list_remove(NEXT_BLKP(bp));
+        seglist_remove(bp);
+        seglist_remove(PREV_BLKP(bp));
+        seglist_remove(NEXT_BLKP(bp));
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
-        list_add(bp);
     }
-    #ifdef NEXT_FIT 
-        last_bp = bp;
-    #endif
+
+    seglist_add(bp, size);
     return bp;
 }
 
-/*
- * mm_free - Freeing a block does nothing.
- */
-void mm_free(void* ptr)
-{
-    size_t size = GET_SIZE(HDRP(ptr));
-
-    PUT(HDRP(ptr), PACK(size, 0));
-    PUT(FTRP(ptr), PACK(size, 0));
-
-    coalesce(ptr);
-}
-
-static void *first_fit(size_t asize)
+static void *find_seg_fit(size_t asize)
 {
     void *bp;
-    for ( bp = free_listp; GET_ALLOC(HDRP(bp))!=1; bp = SUCC_LINK(bp) ) {
-        if (asize<=GET_SIZE(HDRP(bp))) {
-            return bp;
+    int targetsize = asize;
+    
+    for (int classidx=0; classidx<SEG_MAX; classidx++) {
+        if ((classidx==SEG_MAX-1) || (targetsize<=1) && (seg_free_list[classidx]!=NULL)) {
+            bp = seg_free_list[classidx];
+            while ((bp!=NULL) && (asize>GET_SIZE(HDRP(bp)))) {
+                bp = NEXT(bp);
+            }
+            if (bp!=NULL) {
+                return bp;
+            }
         }
+        targetsize>>=1;
     }
     return NULL;
 }
 
-#ifdef NEXT_FIT 
-    void *next_fit(size_t asize)
-    {
-        void *bp;
-        for ( bp = last_bp; GET_SIZE(HDRP(bp))>0; bp = NEXT_BLKP(bp) ) {
-            if ( (!GET_ALLOC(HDRP(bp))) && (asize<=GET_SIZE(HDRP(bp))) ) {
-                return bp;
-            }
-        }
-        return NULL;
-    }
-#endif
+void seglist_add(void* ptr, size_t size)
+{
+    int idx = 0;
+    void *search_ptr = ptr;
+    void *insert_ptr = NULL;
 
-static void list_add(void *p){
-    SUCC_LINK(p) = free_listp;
-    PRED_LINK(free_listp) = p;
-    PRED_LINK(p) = NULL;
-    free_listp = p;
+    // Select segregated list 
+    // 사이즈에 맞는 가용 리스트의 인덱스 찾기
+    while ((idx<SEG_MAX-1) && (size>1)) {
+        size>>=1;
+        idx++;
+    }
+
+    // Keep size ascending order and search
+    search_ptr = seg_free_list[idx];    // search_ptr이 할당되어있으면 null이 아니겠지?
+    // 첫 삽입이라면 search_ptr이 null이니까 반복문을 거치치 않음
+    // 이 위치에 삽입이 되어있다면 null이 아닐 것이고 기존 블록의 사이즈보다 만들려는 사이즈가 더 크면 반복문 시작
+    // 이게 가용 리스트에서 찾는 게 아니라 할당된 리스트에서 찾는거지?
+    // insert_ptr이 가리키는 곳은 연속된 힐당된 주소 중 가장 끝에 있는 주소
+    while ((search_ptr != NULL) && (size > GET_SIZE(HDRP(search_ptr)))) {
+        insert_ptr = search_ptr;        // insert ptr에 기존에 있던 주소값으로 업데이트
+        search_ptr = NEXT(search_ptr);  // search ptr의 위치를 뒤 블록으로 옮김
+    }
+    
+    // Set NEXT and PREV 
+    // 이제부터 insert_ptr이 앞 블록, search_ptr이 뒷 블록이라고 보면 되겠지?
+    if (search_ptr != NULL) {
+        if (insert_ptr != NULL) {       // 앞뒤가 모두 할당된 블록인 경우
+            SET_PTR(NEXT_PTR(ptr), search_ptr);     // 가용 리스트의 ptr의 next를 뒷 블록 주소로 변경
+            SET_PTR(PREV_PTR(search_ptr), ptr);     // 뒷 블록의 앞 주소를 ptr로 변경
+            SET_PTR(PREV_PTR(ptr), insert_ptr);     // ptr의 앞 주소를 앞 블록 주소로 변경
+            SET_PTR(NEXT_PTR(insert_ptr), ptr);     // 앞 주소의 뒷 주소를 ptr로 변경
+        } else {                        // 앞이 비었고 뒤가 할당된 경우
+            SET_PTR(NEXT_PTR(ptr), search_ptr);     // ptr의 다음 주소를 뒷 블록으로 변경
+            SET_PTR(PREV_PTR(search_ptr), ptr);     // 뒷 블록의 앞 주소를 ptr로 변경
+            SET_PTR(PREV_PTR(ptr), NULL);           // ptr의 앞 주소를 null로 변경
+            seg_free_list[idx] = ptr;       // 가용 리스트의 인덱스에 ptr 업데이트. 앞 포인터가 갱신되는 상황이니까?
+        }
+    } else {
+        if (insert_ptr != NULL) {       // 앞이 할당되었고 뒤가 비어있는 경우
+            SET_PTR(NEXT_PTR(ptr), NULL);           // ptr의 뒷 주소를 null로 변경
+            SET_PTR(PREV_PTR(ptr), insert_ptr);     // ptr의 앞 주소를 앞 블록으로 변경
+            SET_PTR(NEXT_PTR(insert_ptr), ptr);     // 앞 블록의 뒷 주소를 ptr로 변경
+        } else {                        // 둘다 비어있는 경우
+            SET_PTR(NEXT_PTR(ptr), NULL);           // ptr의 앞 주소 null로 변경
+            SET_PTR(PREV_PTR(ptr), NULL);           // ptr의 뒷 주소 null로 변경
+            seg_free_list[idx] = ptr;       // 가용 리스트의 인덱스에 ptr 업데이트. 앞 포인터가 갱신되는 상황이니까?
+        }
+    }
+    
+    return;
 }
 
-static void list_remove(void *p){
-    // 맨 앞 블록을 삭제하는 경우
-    if (free_listp == p) {
-        PRED_LINK(SUCC_LINK(p)) = NULL;
-        free_listp = SUCC_LINK(p);
+void seglist_remove(void *ptr) {
+    int idx = 0;
+    size_t size = GET_SIZE(HDRP(ptr));
+    
+    // Select segregated list 
+    // 사이즈에 맞는 가용 리스트의 인덱스 찾기
+    while ((idx<SEG_MAX-1) && (size>1)) {
+        size>>=1;
+        idx++;
     }
-    // 중간 블록을 삭제하는 경우
-    else {
-        SUCC_LINK(PRED_LINK(p)) = SUCC_LINK(p);
-        PRED_LINK(SUCC_LINK(p)) = PRED_LINK(p);
+    
+    if (NEXT(ptr) != NULL) {
+        if (PREV(ptr) != NULL) {        // 앞 블록과 뒷 블록이 할당되어있는 경우
+            SET_PTR(PREV_PTR(NEXT(ptr)), PREV(ptr));    // 뒷 블록의 앞 주소를 앞 블록으로
+            SET_PTR(NEXT_PTR(PREV(ptr)), NEXT(ptr));    // 앞 블록의 뒷 주소를 뒷 블록으로
+        } else {    // 앞 블록이 가용 블록이고 뒷 블록이 할당된 경우
+            SET_PTR(PREV_PTR(NEXT(ptr)), NULL);         // 뒷 블록의 앞 주소를 null로 변경
+            seg_free_list[idx] = NEXT(ptr);     // 가용 리스트에 뒷 블록 주소 넣기
+        }
+    } else {
+        if (PREV(ptr) != NULL) {        // 앞 블록이 할당되었고 뒷 블록이 가용 블록인 경우
+            SET_PTR(NEXT_PTR(PREV(ptr)), NULL);         // 앞 블록의 뒷 주소를 null로 변경
+        } else {                        // 앞 블록과 뒷 블록 모두 가용 블록인 경우
+            seg_free_list[idx] = NULL;          // 가용 리스트에 null 
+        }
     }
+    
+    return;
 }
 
 void place(void *bp, size_t asize) 
@@ -265,20 +308,33 @@ void place(void *bp, size_t asize)
     size_t current_size = GET_SIZE(HDRP(bp));
     
     if ((current_size - asize) < 2*DSIZE ) { // 사이즈 할당하고도 2*DSIZE (최소블럭크기) 이하로 남는다면 이후도 아무 것도 못 넣으니, 그냥 현재 도착한 블록 전체를 할당. 헤더, 푸터만 갱신.
-        list_remove(bp);
+        seglist_remove(bp);
         PUT(HDRP(bp), PACK(current_size, 1));
         PUT(FTRP(bp), PACK(current_size, 1));
     }
     else {                                   // 사이즈 할당하고도 최소블럭크기 이상으로 남으면 블록을 분할하여 딱 맞는 사이즈로 헤더와 푸터를 갱신.
-        list_remove(bp);
+        seglist_remove(bp);
         PUT(HDRP(bp), PACK(asize, 1));
         PUT(FTRP(bp), PACK(asize, 1));
-        bp = NEXT_BLKP(bp);             // 남은 블록을 새로운 블록으로서 새롭게 헤더와 푸터 지정.
+        bp = NEXT_BLKP(bp);                  // 남은 블록을 새로운 블록으로서 새롭게 헤더와 푸터 지정.
         PUT(HDRP(bp), PACK(current_size - asize, 0)); 
         PUT(FTRP(bp), PACK(current_size - asize, 0));
+        seglist_add(bp, current_size - asize);
 
         coalesce(bp);
     }
+}
+
+void mm_free(void *bp)
+{
+    size_t size = GET_SIZE(HDRP(bp));
+
+    PUT(HDRP(bp), PACK(size, 0));
+    PUT(FTRP(bp), PACK(size, 0));
+
+    seglist_add(bp, size);
+
+    coalesce(bp);
 }
 
 /* 
@@ -307,11 +363,8 @@ void *mm_malloc(size_t size) // 한 마디로 mm_malloc() 함수는 인자로 si
         // (size + DSIZE + 7) == 할당하고자 하는 내용의 크기 + block header(==4) + block footer(==4) + 오로지 적절한 값을 구하기 위하여 더해주는 값 7
     }
 
-    if ((bp = first_fit(asize)) != NULL) {
-        place(bp, asize); // bp : 데이터를 할당할 수 있는 공간의 시작 위치
-        #ifdef NEXT_FIT 
-            last_bp = bp;
-        #endif
+    if ((bp = find_seg_fit(asize)) != NULL) {
+        place(bp, asize);
         return bp;
     }
 
